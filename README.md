@@ -91,7 +91,7 @@
 
 Новости, анонсы обновлений и обсуждения справочников выходят в наших каналах:
 - **ВКонтакте**: https://m.vk.ru/alekseyenin
-- **Telegram**: https://t.me/eavprog
+- **Telegram**: https://t.me/AlekseyEnin
 - **MAX**: https://max.ru/channel_prog815
 - **LinkedIn**: https://www.linkedin.com/in/eavprog/
 
