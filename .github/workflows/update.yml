@@ -1,0 +1,171 @@
+name: Weekly Minjust Unwanted Update
+
+on:
+  schedule:
+    - cron: '0 17 * * 3'      # 17:00 UTC = 20:00 МСК, среда. Раз в неделю —
+                              # чтобы не беспокоить портал открытых данных ежедневно
+                              # и не провоцировать блокировку по IP/частоте запросов.
+  workflow_dispatch:          # ручной запуск для отладки
+
+jobs:
+  sync-and-trigger:
+    runs-on: ubuntu-24.04     # пин от миграции ubuntu-latest → 26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write         # встроенный токен Actions для коммита
+
+    env:
+      # API-токен Kaggle нового образца (CLI >= 1.8.0).
+      # В репозитории секрет называется KAGGLE_API_TOKEN_MINJUST_UNWANTED.
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN_MINJUST_UNWANTED }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install Kaggle CLI с поддержкой API-токенов (>= 1.8.0)
+        run: |
+          pip install -q --upgrade kaggle
+          kaggle --version
+          python - <<'EOF'
+          import re, subprocess
+          out = subprocess.check_output(["kaggle", "--version"], text=True).strip()
+          m = re.search(r"(\d+)\.(\d+)", out)
+          assert m and tuple(map(int, m.groups())) >= (1, 8), \
+              f"нужен kaggle CLI >= 1.8.0 для API-токенов, получен: {out}"
+          print("OK: kaggle CLI поддерживает API-токены")
+          EOF
+
+      - name: Download latest kernel output
+        run: |
+          mkdir -p ./output
+          kaggle kernels output eavprog/minjust-unwanted-organizations-downloader -p ./output
+          echo "Содержимое output:"
+          find ./output -maxdepth 4 -type f | head -30
+          echo ""
+          echo "--- Лог/диагностика тетрадки (если есть) ---"
+          for f in ./output/*.log ./output/*.txt ./output/__notebook*.ipynb; do
+            [ -f "$f" ] && { echo ">>> $f (last 50 lines) >>>"; tail -n 50 "$f"; echo "<<< $f <<<"; echo ""; }
+          done || true
+
+      - name: Check files present (FILES_OK)
+        id: check_files
+        run: |
+          # Тетрадка minjust пишет публикуемые артефакты в подпапку
+          # /kaggle/working/minjust_data/web — как ОКТМО/ОКАТО, а не в корень.
+          # Поэтому SRC = ./output/minjust_data/web, а НЕ ./output.
+          SRC=./output/minjust_data/web
+          MISSING=0
+          for f in minjust.json.gz minjust_meta.json.gz; do
+            if [ -f "$SRC/$f" ]; then
+              echo "found $f"
+            else
+              echo "::warning::MISSING $f в $SRC (тетрадка упала или писала не туда)"
+              MISSING=$((MISSING+1))
+            fi
+          done
+          if [ "$MISSING" -gt 0 ]; then
+            echo "❌ Отсутствует $MISSING из 2 файлов — коммит пропущен"
+            echo "FILES_OK=false" >> "$GITHUB_ENV"
+          else
+            echo "✅ Все 2 файла на месте"
+            echo "FILES_OK=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check if data changed (DATA_CHANGED)
+        id: check_data
+        if: env.FILES_OK == 'true'
+        run: |
+          SRC=./output/minjust_data/web
+          NEW_META="$SRC/minjust_meta.json.gz"
+          OLD_META="./minjust_meta.json.gz"
+
+          if [ ! -f "$OLD_META" ]; then
+            echo "Первый запуск: старой меты нет. Считаем данные изменёнными."
+            echo "DATA_CHANGED=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          NEW_HASH=$(python -c "import gzip,json; print(json.load(gzip.open('$NEW_META'))['data_hash'])")
+          OLD_HASH=$(python -c "import gzip,json; print(json.load(gzip.open('$OLD_META'))['data_hash'])")
+
+          echo "Новый data_hash:  $NEW_HASH"
+          echo "Старый data_hash: $OLD_HASH"
+
+          if [ "$NEW_HASH" = "$OLD_HASH" ]; then
+            echo "✅ Данные не изменились с прошлой сборки — коммит не требуется"
+            echo "DATA_CHANGED=false" >> "$GITHUB_ENV"
+          else
+            echo "Данные изменились — переходим к валидации"
+            echo "DATA_CHANGED=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check metadata — гейт публикации META_OK
+        id: check_meta
+        if: env.FILES_OK == 'true' && env.DATA_CHANGED == 'true'
+        run: |
+          SRC=./output/minjust_data/web
+          export META="$SRC/minjust_meta.json.gz"
+          python - <<'EOF'
+          import gzip, json, os, sys
+          meta = json.load(gzip.open(os.environ['META']))
+
+          errors = []
+          if not meta.get('publish_allowed'):
+              errors.append(f"publish_allowed is {meta.get('publish_allowed')!r}")
+          if meta.get('critical_errors'):
+              errors.append(f"critical_errors: {meta['critical_errors']}")
+          if meta.get('records_count', 0) <= 0:
+              errors.append(f"records_count <= 0: {meta.get('records_count')!r}")
+          dh = meta.get('data_hash', '')
+          dhf = meta.get('data_hash_full', '')
+          if len(dhf) != 64:
+              errors.append(f"data_hash_full length {len(dhf)} != 64")
+          if dh != dhf[:16]:
+              errors.append(f"data_hash mismatch: {dh!r} != {dhf[:16]!r}")
+          if not meta.get('source_date'):
+              errors.append("source_date is empty")
+          if not meta.get('change_display'):
+              errors.append("change_display is empty")
+
+          if errors:
+              print("META_OK=false", file=sys.stderr)
+              print("\n".join(errors), file=sys.stderr)
+              sys.exit(1)
+          print(f"META_OK=true (records={meta['records_count']}, source_date={meta['source_date']})")
+          EOF
+          echo "META_OK=true" >> "$GITHUB_ENV"
+
+      - name: Copy web files to repo root
+        if: env.FILES_OK == 'true' && env.DATA_CHANGED == 'true' && env.META_OK == 'true'
+        run: |
+          SRC=./output/minjust_data/web
+          cp "$SRC/minjust.json.gz" ./minjust.json.gz
+          cp "$SRC/minjust_meta.json.gz" ./minjust_meta.json.gz
+          echo "✅ Файлы скопированы в корень репозитория"
+
+      - name: Commit and push changes
+        if: env.FILES_OK == 'true' && env.DATA_CHANGED == 'true' && env.META_OK == 'true'
+        run: |
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add minjust.json.gz minjust_meta.json.gz
+
+          if git diff --cached --quiet; then
+            echo "✅ Изменений нет (файлы идентичны) — коммит не требуется"
+          else
+            SOURCE_DATE=$(python -c "import gzip,json; print(json.load(gzip.open('minjust_meta.json.gz')).get('source_date','?'))")
+            git commit -m "Auto-update: Minjust Unwanted data from kernel output (source $SOURCE_DATE) [skip ci]"
+            git push
+            echo "✅ Изменения запушены"
+          fi
+
+      - name: Trigger new notebook run (fire-and-forget, всегда)
+        if: always()
+        run: |
+          mkdir -p ./nb
+          kaggle kernels pull eavprog/minjust-unwanted-organizations-downloader -p ./nb --metadata
+          kaggle kernels push -p ./nb
+          echo "✅ Тетрадка перезапущена (round-trip); workflow не ждёт её завершения"
